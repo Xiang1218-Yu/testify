@@ -29,6 +29,79 @@ type Suite struct {
 
 	// Parent suite to have access to the implemented methods of parent struct
 	s TestingSuite
+
+	// depParallel, when set, is consumed once by Parallel to release the
+	// sequential token of the test currently starting in the dependency
+	// scheduler, allowing it to run concurrently with other parallel
+	// tests. depParallelID identifies the installation so that a
+	// finishing parallel test cannot clear a later test's callback.
+	// depScheduling reports whether a dependency run is in progress; all
+	// fields are guarded by depMu.
+	depMu           sync.Mutex
+	depParallel     func()
+	depParallelID   uint64
+	depScheduling   bool
+}
+
+// Parallel marks the current test as allowed to run concurrently with other
+// parallel tests in a suite that declares test dependencies (see
+// DependentTestSuite). Dependencies are still enforced: the test does not
+// start until all of its prerequisites have completed, and tests depending
+// on it wait for it to finish.
+//
+// Parallel must be called at most once from the test method, typically as
+// its first statement. Tests that do not call Parallel keep running
+// sequentially. In a suite without dependency declarations Parallel falls
+// back to (*testing.T).Parallel.
+func (suite *Suite) Parallel() {
+	suite.depMu.Lock()
+	release := suite.depParallel
+	suite.depParallel = nil
+	// Invalidate the installation so a late callback from this test can
+	// never clear a later test's handshake.
+	suite.depParallelID++
+	scheduling := suite.depScheduling
+	suite.depMu.Unlock()
+
+	if release != nil {
+		release()
+		return
+	}
+	if scheduling {
+		// Parallel was already consumed for this test. Repeated calls
+		// are ignored rather than disturbing other scheduled tests.
+		return
+	}
+	suite.T().Parallel()
+}
+
+// setDependencyParallel installs the callback consumed by Parallel for the
+// test that is currently holding the sequential token, and returns an
+// installation ID used to clear only this exact callback later.
+func (suite *Suite) setDependencyParallel(release func()) uint64 {
+	suite.depMu.Lock()
+	defer suite.depMu.Unlock()
+	suite.depParallel = release
+	suite.depParallelID++
+	return suite.depParallelID
+}
+
+// clearDependencyParallel removes the callback only when it is still the
+// installation identified by id.
+func (suite *Suite) clearDependencyParallel(id uint64) {
+	suite.depMu.Lock()
+	defer suite.depMu.Unlock()
+	if suite.depParallelID == id {
+		suite.depParallel = nil
+	}
+}
+
+// setDependencyScheduling marks that a dependency-graph run is active, so
+// stray Parallel calls without an installed callback become no-ops.
+func (suite *Suite) setDependencyScheduling(active bool) {
+	suite.depMu.Lock()
+	defer suite.depMu.Unlock()
+	suite.depScheduling = active
 }
 
 // T retrieves the current *testing.T context.
@@ -139,6 +212,7 @@ func Run(t *testing.T, suite TestingSuite) {
 	}
 
 	var tests []test
+	var allTestNames []string
 	methodFinder := reflect.TypeOf(suite)
 	suiteName := methodFinder.Elem().Name()
 
@@ -158,6 +232,10 @@ func Run(t *testing.T, suite TestingSuite) {
 		if !strings.HasPrefix(method.Name, "Test") {
 			continue
 		}
+		// Record every test method, even if it is filtered out below, so
+		// that dependency declarations can be validated against the full
+		// set of tests.
+		allTestNames = append(allTestNames, method.Name)
 		// Apply -testify.m filter
 		if matchMethodRE != nil && !matchMethodRE.MatchString(method.Name) {
 			continue
@@ -215,6 +293,19 @@ func Run(t *testing.T, suite TestingSuite) {
 		tests = append(tests, test)
 	}
 
+	// Build and validate the dependency graph before anything runs when
+	// the suite declares dependencies. Suites without declarations keep
+	// their original, reflection-ordered behaviour.
+	var dependencyNodes []*depTest
+	dependentSuite, hasDependencies := suite.(DependentTestSuite)
+	if hasDependencies {
+		nodes, err := buildDependencyGraph(suiteName, allTestNames, tests, dependentSuite.Dependencies())
+		if err != nil {
+			t.Fatalf("%s", err)
+		}
+		dependencyNodes = nodes
+	}
+
 	if len(tests) == 0 {
 		return
 	}
@@ -237,6 +328,11 @@ func Run(t *testing.T, suite TestingSuite) {
 			suiteWithStats.HandleStats(suiteName, stats)
 		}
 	}()
+
+	if hasDependencies {
+		runDependencyTests(t, suite, dependencyNodes, stats)
+		return
+	}
 
 	runTests(t, tests)
 }

@@ -64,3 +64,27 @@ type SetupSubTest interface {
 type TearDownSubTest interface {
 	TearDownSubTest()
 }
+
+// DependentTestSuite is implemented by a suite that declares explicit
+// dependencies between its test methods. When a suite implements this
+// interface, the tests are no longer run in reflection order: the
+// dependency graph is validated before anything runs and then used to
+// compute a stable execution order.
+//
+// Dependencies returns a map from a test method name to the names of the
+// test methods that must complete successfully before the named test is
+// allowed to run. If any prerequisite test fails or is skipped, the
+// dependent test and, transitively, every test depending on it are
+// skipped automatically, and the skip message preserves the upstream
+// reason.
+//
+// A cleanup test simply declares the test that prepared its resources as
+// a prerequisite: it then runs when the preparation succeeded and is
+// skipped when it did not.
+//
+// The graph must not contain unknown test names, duplicate prerequisite
+// entries or dependency cycles; such problems are reported before any
+// test (including SetupSuite) runs.
+type DependentTestSuite interface {
+	Dependencies() map[string][]string
+}

@@ -5,7 +5,14 @@
 // or individual tests (depending on which interface(s) you
 // implement).
 //
-// The suite package does not support parallel tests. See [issue 934].
+// Tests run sequentially in reflection order unless the suite implements
+// DependentTestSuite: then their dependencies decide a stable execution
+// order, failed or skipped prerequisites make dependents skip with a
+// reason, and Suite.Parallel allows individual tests to run concurrently
+// without violating the dependency graph.
+//
+// Without DependentTestSuite the package does not support parallel tests.
+// See [issue 934].
 //
 // A testing suite is usually built by first extending the built-in
 // suite functionality from suite.Suite in testify.  Alternatively,

@@ -1,11 +1,16 @@
 package suite
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 // SuiteInformation stats stores stats for the whole suite execution.
 type SuiteInformation struct {
 	Start, End time.Time
 	TestStats  map[string]*TestInformation
+
+	mu sync.Mutex
 }
 
 // TestInformation stores information about the execution of each test.
@@ -25,6 +30,8 @@ func (s *SuiteInformation) start(testName string) {
 	if s == nil {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.TestStats[testName] = &TestInformation{
 		TestName: testName,
 		Start:    time.Now(),
@@ -35,6 +42,8 @@ func (s *SuiteInformation) end(testName string, passed bool) {
 	if s == nil {
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.TestStats[testName].End = time.Now()
 	s.TestStats[testName].Passed = passed
 }
