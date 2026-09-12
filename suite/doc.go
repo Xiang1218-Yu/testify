@@ -30,6 +30,26 @@
 // of test suites specified command-line argument "-m".
 // Suite object has assertion methods.
 //
+// Fixed shards for parallel CI execution:
+//
+// To run a large suite across several CI jobs, pass the total number of
+// shards and the 1-based index of the shard this job is responsible for:
+//
+//	go test ./... -testify.shardcount N -testify.shardindex i
+//
+// Every suite method is assigned to exactly one shard using a stable hash
+// of its full name ("SuiteName/TestMethod"), so the same suite is
+// partitioned identically on every machine and independently of the order
+// in which methods are discovered. Adding, removing or renaming a method
+// only changes the ownership of that method. Methods that belong to
+// another shard are reported as skipped with a reason naming the shard
+// that runs them; their SetupTest/BeforeTest/AfterTest/TearDownTest
+// callbacks are not invoked. Sharding composes with "-testify.m" (the
+// regexp is applied first) and leaves "-testify.m" and the non-sharded
+// behaviour unchanged. When the suite implements WithStats, the
+// SuiteInformation carries ShardCount/ShardIndex and every method (even
+// the skipped ones) is recorded in TestStats.
+//
 // A crude example:
 //
 //	// Basic imports

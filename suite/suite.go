@@ -123,6 +123,11 @@ func (suite *Suite) Run(name string, subtest func()) bool {
 type test = struct {
 	name string
 	run  func(t *testing.T)
+
+	// skip and skipReason mark a test that belongs to another shard: it is
+	// still reported as a skipped subtest instead of being executed.
+	skip       bool
+	skipReason string
 }
 
 // Run takes a testing suite and runs all of the tests attached
@@ -152,6 +157,16 @@ func Run(t *testing.T, suite TestingSuite) {
 		}
 	}
 
+	shards, err := newSharding(*shardCount, *shardIndex)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "testify: %s\n", err)
+		os.Exit(1)
+	}
+	if stats != nil && shards.enabled() {
+		stats.ShardCount = shards.total
+		stats.ShardIndex = shards.index + 1
+	}
+
 	for i := 0; i < methodFinder.NumMethod(); i++ {
 		method := methodFinder.Method(i)
 
@@ -161,6 +176,22 @@ func Run(t *testing.T, suite TestingSuite) {
 		// Apply -testify.m filter
 		if matchMethodRE != nil && !matchMethodRE.MatchString(method.Name) {
 			continue
+		}
+		// Apply fixed shard assignment, computed from the stable full test
+		// name so every machine partitions the suite identically. A test
+		// owned by another shard is reported as skipped with a reason that
+		// names the shard responsible for running it.
+		fullName := suiteName + "/" + method.Name
+		if shards.enabled() {
+			owner := shards.owner(fullName)
+			if owner != shards.index {
+				tests = append(tests, test{
+					name:       method.Name,
+					skip:       true,
+					skipReason: shards.skipReason(fullName, owner),
+				})
+				continue
+			}
 		}
 		// Check method signature
 		if method.Type.NumIn() > 1 || method.Type.NumOut() > 0 {
@@ -238,16 +269,27 @@ func Run(t *testing.T, suite TestingSuite) {
 		}
 	}()
 
-	runTests(t, tests)
+	runTests(t, tests, stats)
 }
 
-func runTests(t *testing.T, tests []test) {
+func runTests(t *testing.T, tests []test, stats *SuiteInformation) {
 	if len(tests) == 0 {
 		t.Log("warning: no tests to run")
 		return
 	}
 
 	for _, test := range tests {
-		t.Run(test.name, test.run)
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			if test.skip {
+				// Keep the test visible in stats and to the testing framework,
+				// but do not run it: another shard owns it. Setup/teardown and
+				// BeforeTest/AfterTest are intentionally not invoked.
+				stats.skip(test.name)
+				t.Skip(test.skipReason)
+				return
+			}
+			test.run(t)
+		})
 	}
 }
