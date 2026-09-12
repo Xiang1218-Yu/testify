@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -848,4 +849,78 @@ func TestSuiteSignatureValidation(t *testing.T) {
 
 	assert.True(t, suiteTester.setUp, "SetupSuite should have been executed")
 	assert.True(t, suiteTester.toreDown, "TearDownSuite should have been executed")
+}
+
+// failureEventDecoratorSuite subscribes to assertion failure events through
+// the TestingTDecorator hook.
+type failureEventDecoratorSuite struct {
+	Suite
+	mu     sync.Mutex
+	events []assert.FailureEvent
+}
+
+func (s *failureEventDecoratorSuite) DecorateTestingT(t assert.TestingT) assert.TestingT {
+	return assert.NewEventT(t, func(event assert.FailureEvent) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.events = append(s.events, event)
+	})
+}
+
+func (s *failureEventDecoratorSuite) TestAssertionFailure() {
+	s.Equal("a", "b", "top level message")
+	s.Run("fatal subtest", func() {
+		s.Require().Equal(1, 2, "subtest message")
+		s.T().Error("must not run after require failure")
+	})
+}
+
+func TestSuiteFailureEvents(t *testing.T) {
+	eventSuite := new(failureEventDecoratorSuite)
+	suiteSuccess := testing.RunTests(allTestsFilter, []testing.InternalTest{
+		{
+			Name: t.Name() + "/failureEventDecoratorSuite",
+			F: func(subT *testing.T) {
+				Run(subT, eventSuite)
+			},
+		},
+	})
+
+	assert.False(t, suiteSuccess, "suite must still report its failing tests through the text output")
+
+	eventSuite.mu.Lock()
+	defer eventSuite.mu.Unlock()
+
+	var topEvents, subEvents []assert.FailureEvent
+	for _, event := range eventSuite.events {
+		switch {
+		case strings.Contains(event.TestName, "TestAssertionFailure/fatal_subtest"):
+			subEvents = append(subEvents, event)
+		case strings.Contains(event.TestName, "TestAssertionFailure"):
+			topEvents = append(topEvents, event)
+		}
+	}
+
+	if len(topEvents) == 0 || len(subEvents) == 0 {
+		t.Fatalf("expected a top level and a subtest failure event, got %+v", eventSuite.events)
+	}
+
+	top := topEvents[0]
+	if top.AssertionName != "Equal" || top.Fatal {
+		t.Errorf("top level event mismatch: %+v", top)
+	}
+	if top.Expected != "a" || top.Actual != "b" || top.Message != "top level message" {
+		t.Errorf("top level event payload mismatch: %+v", top)
+	}
+
+	sub := subEvents[0]
+	if sub.AssertionName != "Equal" || !sub.Fatal {
+		t.Errorf("subtest event must be a fatal Equal, got %+v", sub)
+	}
+	if sub.Message != "subtest message" {
+		t.Errorf("subtest event message = %q", sub.Message)
+	}
+	if !strings.HasSuffix(sub.File, "/suite/suite_test.go") {
+		t.Errorf("subtest event File = %q, want the suite test file", sub.File)
+	}
 }

@@ -788,3 +788,91 @@ func TestEventuallyWithTTrue(t *testing.T) {
 	False(t, mockT.Failed, "Check should pass")
 	Equal(t, 2, counter, "Condition is expected to be called 2 times")
 }
+
+// eventSinkMockT is a MockT that additionally collects FailureEvents.
+type eventSinkMockT struct {
+	MockT
+	events []assert.FailureEvent
+}
+
+func (t *eventSinkMockT) OnAssertionFailure(event assert.FailureEvent) {
+	t.events = append(t.events, event)
+}
+
+func TestRequireEmitsSingleFatalFailureEvent(t *testing.T) {
+	t.Parallel()
+
+	mt := &eventSinkMockT{}
+	Equal(mt, 1, 2, "boom")
+
+	if len(mt.events) != 1 {
+		t.Fatalf("a require failure must emit exactly one event, got %d", len(mt.events))
+	}
+	event := mt.events[0]
+	if !event.Fatal {
+		t.Error("require event must be fatal")
+	}
+	if event.AssertionName != "Equal" {
+		t.Errorf("AssertionName = %q, want Equal", event.AssertionName)
+	}
+	if event.Expected != 1 || event.Actual != 2 {
+		t.Errorf("Expected/Actual = %v/%v", event.Expected, event.Actual)
+	}
+	if event.Message != "boom" {
+		t.Errorf("Message = %q, want %q", event.Message, "boom")
+	}
+	if !mt.Failed {
+		t.Error("FailNow must still be called")
+	}
+
+	// Formatted and forwarding variants are fatal and normalized.
+	Truef(mt, false, "fmt %d", 1)
+	New(mt).Contains("hello", "xyz")
+	FailNow(mt, "terminal")
+
+	if len(mt.events) != 4 {
+		t.Fatalf("expected four events in total, got %d", len(mt.events))
+	}
+	if mt.events[1].AssertionName != "True" || !mt.events[1].Fatal || mt.events[1].Message != "fmt 1" {
+		t.Errorf("Truef event mismatch: %+v", mt.events[1])
+	}
+	if mt.events[2].AssertionName != "Contains" || !mt.events[2].Fatal ||
+		mt.events[2].Expected != "xyz" || mt.events[2].Actual != "hello" {
+		t.Errorf("Contains event mismatch: %+v", mt.events[2])
+	}
+	if mt.events[3].AssertionName != "FailNow" || !mt.events[3].Fatal {
+		t.Errorf("FailNow event mismatch: %+v", mt.events[3])
+	}
+	for i := 1; i < len(mt.events); i++ {
+		if mt.events[i].ID <= mt.events[i-1].ID {
+			t.Fatal("event IDs must be unique and increasing")
+		}
+	}
+}
+
+func TestRequireEventuallyWithTTimeoutEventIsFatal(t *testing.T) {
+	t.Parallel()
+
+	mt := &eventSinkMockT{}
+	EventuallyWithT(mt, func(c *assert.CollectT) {
+		// require.True terminates only the tick goroutine; the replayed
+		// event must be non-fatal, while the timeout itself is fatal.
+		True(c, false)
+	}, 30*time.Millisecond, 10*time.Millisecond)
+
+	if !mt.Failed {
+		t.Fatal("require.EventuallyWithT must call FailNow on timeout")
+	}
+	if len(mt.events) < 2 {
+		t.Fatalf("expected tick events and the outer timeout event, got %+v", mt.events)
+	}
+	for _, event := range mt.events[:len(mt.events)-1] {
+		if event.Fatal {
+			t.Errorf("tick event must be non-fatal: %+v", event)
+		}
+	}
+	outer := mt.events[len(mt.events)-1]
+	if outer.AssertionName != "EventuallyWithT" || !outer.Fatal {
+		t.Errorf("outer timeout event must be a fatal EventuallyWithT event, got %+v", outer)
+	}
+}

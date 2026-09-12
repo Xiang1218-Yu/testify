@@ -469,16 +469,16 @@ func compareTwoValues(t TestingT, e1 interface{}, e2 interface{}, allowedCompare
 	e1Kind := reflect.ValueOf(e1).Kind()
 	e2Kind := reflect.ValueOf(e2).Kind()
 	if e1Kind != e2Kind {
-		return Fail(t, "Elements should be the same type", msgAndArgs...)
+		return failWithValues(t, "Elements should be the same type", e2, e1, msgAndArgs...)
 	}
 
 	compareResult, isComparable := compare(e1, e2, e1Kind)
 	if !isComparable {
-		return Fail(t, fmt.Sprintf(`Can not compare type "%T"`, e1), msgAndArgs...)
+		return failWithValues(t, fmt.Sprintf(`Can not compare type "%T"`, e1), e2, e1, msgAndArgs...)
 	}
 
 	if !containsValue(allowedComparesResults, compareResult) {
-		return Fail(t, failMessage, msgAndArgs...)
+		return failWithValues(t, failMessage, e2, e1, msgAndArgs...)
 	}
 
 	return true

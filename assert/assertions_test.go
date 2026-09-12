@@ -4217,3 +4217,312 @@ func TestNotErrorAsWithErrorTooLongToPrint(t *testing.T) {
 	            	in chain: "long: [0 0 0`)
 	Contains(t, mockT.errorString(), "<... truncated>")
 }
+
+// eventRecorderT is a TestingT that also implements FailureEventSink for the
+// failure event tests.
+type eventRecorderT struct {
+	name      string
+	text      strings.Builder
+	events    []FailureEvent
+	failNowed bool
+}
+
+func (e *eventRecorderT) Errorf(format string, args ...interface{}) {
+	fmt.Fprintf(&e.text, format, args...)
+}
+
+// Helper is like [testing.T.Helper] but does nothing.
+func (*eventRecorderT) Helper() {}
+
+func (e *eventRecorderT) Name() string {
+	return e.name
+}
+
+func (e *eventRecorderT) FailNow() {
+	e.failNowed = true
+}
+
+func (e *eventRecorderT) OnAssertionFailure(event FailureEvent) {
+	e.events = append(e.events, event)
+}
+
+func TestFailureEventCapturesStructuredFields(t *testing.T) {
+	t.Parallel()
+
+	rec := &eventRecorderT{name: "TestFailureEventCapturesStructuredFields/sub"}
+	_, file, line, _ := runtime.Caller(0)
+	Equal(rec, "want", "got", "hello %s", "world")
+
+	if len(rec.events) != 1 {
+		t.Fatalf("expected exactly one failure event, got %d", len(rec.events))
+	}
+	event := rec.events[0]
+	if event.ID == 0 {
+		t.Error("event ID must be assigned")
+	}
+	if event.Time.IsZero() {
+		t.Error("event Time must be assigned")
+	}
+	if event.AssertionName != "Equal" {
+		t.Errorf("AssertionName = %q, want Equal", event.AssertionName)
+	}
+	if event.Expected != "want" {
+		t.Errorf("Expected = %v, want %q", event.Expected, "want")
+	}
+	if event.Actual != "got" {
+		t.Errorf("Actual = %v, want %q", event.Actual, "got")
+	}
+	if event.Message != "hello world" {
+		t.Errorf("Message = %q, want %q", event.Message, "hello world")
+	}
+	if !strings.Contains(event.FailureMessage, "Not equal") {
+		t.Errorf("FailureMessage = %q, want it to contain %q", event.FailureMessage, "Not equal")
+	}
+	if event.File != file {
+		t.Errorf("File = %q, want %q", event.File, file)
+	}
+	if event.Line != line+1 {
+		t.Errorf("Line = %d, want %d", event.Line, line+1)
+	}
+	if event.Fatal {
+		t.Error("assert failure must not be fatal")
+	}
+	if event.TestName != "TestFailureEventCapturesStructuredFields/sub" {
+		t.Errorf("TestName = %q", event.TestName)
+	}
+
+	// Text output is still produced unchanged.
+	if !strings.Contains(rec.text.String(), "Error Trace:") {
+		t.Errorf("text output must keep the labeled layout, got:\n%s", rec.text.String())
+	}
+	if !strings.Contains(rec.text.String(), "Messages:") {
+		t.Errorf("text output must keep the Messages section, got:\n%s", rec.text.String())
+	}
+}
+
+func TestFailureEventNormalizesVariants(t *testing.T) {
+	t.Parallel()
+
+	// Formatted variant.
+	recF := &eventRecorderT{}
+	Equalf(recF, 1, 2, "msg %d", 7)
+	if len(recF.events) != 1 {
+		t.Fatalf("expected one event for Equalf, got %d", len(recF.events))
+	}
+	if recF.events[0].AssertionName != "Equal" {
+		t.Errorf("Equalf event name = %q, want Equal", recF.events[0].AssertionName)
+	}
+	if recF.events[0].Message != "msg 7" {
+		t.Errorf("Equalf message = %q", recF.events[0].Message)
+	}
+
+	// Forwarding method on Assertions.
+	recA := &eventRecorderT{}
+	New(recA).Equal("a", "b")
+	if len(recA.events) != 1 || recA.events[0].AssertionName != "Equal" {
+		t.Fatalf("Assertions.Equal must produce one normalized Equal event, got %+v", recA.events)
+	}
+
+	// Unary and comparison assertions carry their values.
+	recTrue := &eventRecorderT{}
+	True(recTrue, false)
+	if len(recTrue.events) != 1 || recTrue.events[0].AssertionName != "True" ||
+		recTrue.events[0].Expected != true || recTrue.events[0].Actual != false {
+		t.Fatalf("True event mismatch: %+v", recTrue.events)
+	}
+
+	recLen := &eventRecorderT{}
+	Len(recLen, []int{1}, 2)
+	if len(recLen.events) != 1 || recLen.events[0].AssertionName != "Len" ||
+		recLen.events[0].Expected != 2 {
+		t.Fatalf("Len event mismatch: %+v", recLen.events)
+	}
+
+	recCmp := &eventRecorderT{}
+	Greater(recCmp, 1, 2)
+	if len(recCmp.events) != 1 || recCmp.events[0].AssertionName != "Greater" ||
+		recCmp.events[0].Expected != 2 || recCmp.events[0].Actual != 1 {
+		t.Fatalf("Greater event mismatch: %+v", recCmp.events)
+	}
+
+	// Successful assertions emit nothing.
+	recOK := &eventRecorderT{}
+	Equal(recOK, 1, 1)
+	True(recOK, true)
+	if len(recOK.events) != 0 {
+		t.Fatalf("successful assertions must not emit events, got %d", len(recOK.events))
+	}
+}
+
+func TestFailureEventFailNowIsFatalAndUnique(t *testing.T) {
+	t.Parallel()
+
+	rec := &eventRecorderT{}
+	FailNow(rec, "boom", "ctx")
+
+	if !rec.failNowed {
+		t.Error("FailNow must be forwarded to the TestingT")
+	}
+	if len(rec.events) != 1 {
+		t.Fatalf("FailNow must produce exactly one event, got %d", len(rec.events))
+	}
+	event := rec.events[0]
+	if !event.Fatal {
+		t.Error("FailNow event must be fatal")
+	}
+	if event.AssertionName != "FailNow" {
+		t.Errorf("AssertionName = %q, want FailNow", event.AssertionName)
+	}
+	if event.Message != "ctx" {
+		t.Errorf("Message = %q", event.Message)
+	}
+
+	// A second, non fatal failure keeps a unique, increasing ID.
+	Equal(rec, 1, 2)
+	if len(rec.events) != 2 {
+		t.Fatalf("expected two events, got %d", len(rec.events))
+	}
+	if rec.events[1].ID <= rec.events[0].ID {
+		t.Error("event IDs must be unique and monotonically increasing")
+	}
+	if rec.events[1].Fatal {
+		t.Error("second event must not be fatal")
+	}
+}
+
+func TestEventTForwardsEventsAndTestingBehavior(t *testing.T) {
+	t.Parallel()
+
+	var captured []FailureEvent
+	rec := &eventRecorderT{name: "TestEventT"}
+	et := NewEventT(rec, func(event FailureEvent) {
+		captured = append(captured, event)
+	})
+
+	if et.Name() != "TestEventT" {
+		t.Errorf("Name() = %q", et.Name())
+	}
+
+	Equal(et, 1, 2, "via wrapper")
+	if len(captured) != 1 {
+		t.Fatalf("expected one callback, got %d", len(captured))
+	}
+	if captured[0].AssertionName != "Equal" || captured[0].TestName != "TestEventT" {
+		t.Errorf("captured event mismatch: %+v", captured[0])
+	}
+	// Text is still written through the wrapped TestingT.
+	if !strings.Contains(rec.text.String(), "Not equal") {
+		t.Errorf("wrapped text output missing, got:\n%s", rec.text.String())
+	}
+
+	// FailNow is forwarded and yields a fatal event.
+	FailNow(et, "stop")
+	if !rec.failNowed {
+		t.Error("EventT must forward FailNow to the wrapped TestingT")
+	}
+	if len(captured) != 2 || !captured[1].Fatal {
+		t.Fatalf("expected a second, fatal event, got %+v", captured)
+	}
+
+	// A nil callback never panics.
+	nilET := NewEventT(rec, nil)
+	NotPanics(t, func() {
+		Equal(nilET, 1, 2)
+	})
+}
+
+func TestFailureEventEventuallyWithTSuccessDeliversNothing(t *testing.T) {
+	t.Parallel()
+
+	rec := &eventRecorderT{name: "TestEventuallyWithTSuccess"}
+	ticks := 0
+	ok := EventuallyWithT(rec, func(c *CollectT) {
+		ticks++
+		True(c, ticks >= 2, "not yet")
+	}, 200*time.Millisecond, 10*time.Millisecond)
+
+	if !ok {
+		t.Fatal("condition should succeed")
+	}
+	if ticks < 2 {
+		t.Fatalf("condition should have failed on at least one tick, got %d", ticks)
+	}
+	if len(rec.events) != 0 {
+		t.Fatalf("successful EventuallyWithT must not deliver transient failures, got %+v", rec.events)
+	}
+}
+
+func TestFailureEventEventuallyWithTTimeoutForwardsLastTick(t *testing.T) {
+	t.Parallel()
+
+	rec := &eventRecorderT{name: "TestEventuallyWithTOwner"}
+	_, file, _, _ := runtime.Caller(0)
+	ok := EventuallyWithT(rec, func(c *CollectT) {
+		True(c, false, "still false")
+	}, 40*time.Millisecond, 10*time.Millisecond)
+
+	if ok {
+		t.Fatal("condition should time out")
+	}
+	if len(rec.events) < 2 {
+		t.Fatalf("expected inner tick event plus outer failure, got %+v", rec.events)
+	}
+	inner := rec.events[0]
+	if inner.AssertionName != "True" {
+		t.Errorf("inner event name = %q, want True", inner.AssertionName)
+	}
+	if inner.Message != "still false" {
+		t.Errorf("inner event message = %q", inner.Message)
+	}
+	if inner.TestName != "TestEventuallyWithTOwner" {
+		t.Errorf("inner event must keep the owning test name, got %q", inner.TestName)
+	}
+	if inner.File != file {
+		t.Errorf("inner event File = %q, want %q", inner.File, file)
+	}
+	if inner.Fatal {
+		t.Error("inner assert failure must not be marked fatal")
+	}
+
+	outer := rec.events[len(rec.events)-1]
+	if outer.AssertionName != "EventuallyWithT" {
+		t.Errorf("outer event name = %q, want EventuallyWithT", outer.AssertionName)
+	}
+	if !strings.Contains(outer.FailureMessage, "Condition never satisfied") {
+		t.Errorf("outer event message = %q", outer.FailureMessage)
+	}
+	for i := 1; i < len(rec.events); i++ {
+		if rec.events[i].ID <= rec.events[i-1].ID {
+			t.Fatal("event IDs must be unique and increasing")
+		}
+	}
+	if !strings.Contains(rec.text.String(), "Condition never satisfied") {
+		t.Errorf("text output must be preserved, got:\n%s", rec.text.String())
+	}
+}
+
+func TestFailureEventEventuallyWithTNormalizesTickAbort(t *testing.T) {
+	t.Parallel()
+
+	rec := &eventRecorderT{}
+	ok := EventuallyWithT(rec, func(c *CollectT) {
+		// FailNow (and require.*) only stop the tick goroutine inside a
+		// condition; the replayed event must not claim the owning test
+		// was terminated.
+		FailNow(c, "tick aborted")
+	}, 30*time.Millisecond, 10*time.Millisecond)
+
+	if ok {
+		t.Fatal("condition should time out")
+	}
+	if len(rec.events) < 2 {
+		t.Fatalf("expected tick event and outer event, got %+v", rec.events)
+	}
+	if rec.events[0].Fatal {
+		t.Errorf("tick-abort event must be normalized to non-fatal: %+v", rec.events[0])
+	}
+	outer := rec.events[len(rec.events)-1]
+	if outer.AssertionName != "EventuallyWithT" || outer.Fatal {
+		t.Errorf("outer event mismatch for assert.EventuallyWithT: %+v", outer)
+	}
+}

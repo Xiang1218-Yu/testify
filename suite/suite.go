@@ -43,8 +43,28 @@ func (suite *Suite) SetT(t *testing.T) {
 	suite.mu.Lock()
 	defer suite.mu.Unlock()
 	suite.t = t
-	suite.Assertions = assert.New(t)
-	suite.require = require.New(t)
+
+	// Let suites decorating the TestingT (e.g. subscribing to failure
+	// events) plug in per subtest, while plain suites keep using t.
+	assertionT := decorateTestingT(suite.s, t)
+	suite.Assertions = assert.New(assertionT)
+	if requireT, ok := assertionT.(require.TestingT); ok {
+		suite.require = require.New(requireT)
+	} else {
+		suite.require = require.New(t)
+	}
+}
+
+// decorateTestingT applies the suite's optional TestingTDecorator. A nil
+// suite (SetT called before SetS) simply returns t unchanged.
+func decorateTestingT(s TestingSuite, t assert.TestingT) assert.TestingT {
+	if s == nil {
+		return t
+	}
+	if decorator, ok := s.(TestingTDecorator); ok {
+		return decorator.DecorateTestingT(t)
+	}
+	return t
 }
 
 // SetS needs to set the current test suite as parent
@@ -130,8 +150,8 @@ type test = struct {
 func Run(t *testing.T, suite TestingSuite) {
 	defer recoverAndFailOnPanic(t)
 
-	suite.SetT(t)
 	suite.SetS(suite)
+	suite.SetT(t)
 
 	var stats *SuiteInformation
 	if _, ok := suite.(WithStats); ok {

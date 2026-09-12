@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -368,6 +369,30 @@ func Fail(t TestingT, failureMessage string, msgAndArgs ...interface{}) bool {
 	if h, ok := t.(tHelper); ok {
 		h.Helper()
 	}
+	return reportFailure(t, failureMessage, nil, msgAndArgs...)
+}
+
+// failureDetail carries the raw compared values of value-bearing assertions
+// into the single failure reporting chokepoint. It is nil for assertions
+// that do not compare an expected with an actual value.
+type failureDetail struct {
+	expected interface{}
+	actual   interface{}
+}
+
+// failureEventCounter is heap allocated so the atomic uint64 stays 64-bit
+// aligned on 32-bit platforms.
+var failureEventCounter = &struct {
+	nextID uint64
+}{}
+
+// reportFailure is the single chokepoint through which every failed
+// assertion flows. It renders the unchanged text output and delivers
+// exactly one FailureEvent when t implements [FailureEventSink].
+func reportFailure(t TestingT, failureMessage string, detail *failureDetail, msgAndArgs ...interface{}) bool {
+	if h, ok := t.(tHelper); ok {
+		h.Helper()
+	}
 	content := []labeledContent{
 		{"Error Trace", strings.Join(CallerInfo(), "\n\t\t\t")},
 		{"Error", failureMessage},
@@ -387,7 +412,37 @@ func Fail(t TestingT, failureMessage string, msgAndArgs ...interface{}) bool {
 
 	t.Errorf("\n%s", ""+labeledOutput(content...))
 
+	if sink, ok := t.(FailureEventSink); ok {
+		name, file, line, fatal := failureOrigin()
+		event := FailureEvent{
+			ID:             atomic.AddUint64(&failureEventCounter.nextID, 1),
+			Time:           time.Now(),
+			AssertionName:  name,
+			Message:        message,
+			FailureMessage: failureMessage,
+			File:           file,
+			Line:           line,
+			Fatal:          fatal,
+		}
+		if n, ok := t.(interface {
+			Name() string
+		}); ok {
+			event.TestName = n.Name()
+		}
+		if detail != nil {
+			event.Expected = detail.expected
+			event.Actual = detail.actual
+		}
+		sink.OnAssertionFailure(event)
+	}
+
 	return false
+}
+
+// failWithValues reports a failure carrying the raw compared values for the
+// FailureEvent payload. The text output is identical to [Fail].
+func failWithValues(t TestingT, failureMessage string, expected, actual interface{}, msgAndArgs ...interface{}) bool {
+	return reportFailure(t, failureMessage, &failureDetail{expected: expected, actual: actual}, msgAndArgs...)
 }
 
 type labeledContent struct {
@@ -470,7 +525,7 @@ func IsType(t TestingT, expectedType, object interface{}, msgAndArgs ...interfac
 	if h, ok := t.(tHelper); ok {
 		h.Helper()
 	}
-	return Fail(t, fmt.Sprintf("Object expected to be of type %T, but was %T", expectedType, object), msgAndArgs...)
+	return failWithValues(t, fmt.Sprintf("Object expected to be of type %T, but was %T", expectedType, object), expectedType, object, msgAndArgs...)
 }
 
 // IsNotType asserts that the specified objects are not of the same type.
@@ -498,16 +553,17 @@ func Equal(t TestingT, expected, actual interface{}, msgAndArgs ...interface{}) 
 		h.Helper()
 	}
 	if err := validateEqualArgs(expected, actual); err != nil {
-		return Fail(t, fmt.Sprintf("Invalid operation: %#v == %#v (%s)",
-			expected, actual, err), msgAndArgs...)
+		return failWithValues(t, fmt.Sprintf("Invalid operation: %#v == %#v (%s)",
+			expected, actual, err), expected, actual, msgAndArgs...)
 	}
 
 	if !ObjectsAreEqual(expected, actual) {
-		diff := diff(expected, actual)
-		expected, actual = formatUnequalValues(expected, actual)
-		return Fail(t, fmt.Sprintf("Not equal: \n"+
+		rawExpected, rawActual := expected, actual
+		diff := diff(rawExpected, rawActual)
+		expected, actual = formatUnequalValues(rawExpected, rawActual)
+		return failWithValues(t, fmt.Sprintf("Not equal: \n"+
 			"expected: %s\n"+
-			"actual  : %s%s", expected, actual, diff), msgAndArgs...)
+			"actual  : %s%s", expected, actual, diff), rawExpected, rawActual, msgAndArgs...)
 	}
 
 	return true
@@ -539,14 +595,14 @@ func Same(t TestingT, expected, actual interface{}, msgAndArgs ...interface{}) b
 
 	same, ok := samePointers(expected, actual)
 	if !ok {
-		return Fail(t, "Both arguments must be pointers", msgAndArgs...)
+		return failWithValues(t, "Both arguments must be pointers", expected, actual, msgAndArgs...)
 	}
 
 	if !same {
 		// both are pointers but not the same type & pointing to the same address
-		return Fail(t, fmt.Sprintf("Not same: \n"+
+		return failWithValues(t, fmt.Sprintf("Not same: \n"+
 			"expected: %[2]s (%[1]T)(%[1]p)\n"+
-			"actual  : %[4]s (%[3]T)(%[3]p)", expected, truncatingFormat("%#v", expected), actual, truncatingFormat("%#v", actual)), msgAndArgs...)
+			"actual  : %[4]s (%[3]T)(%[3]p)", expected, truncatingFormat("%#v", expected), actual, truncatingFormat("%#v", actual)), expected, actual, msgAndArgs...)
 	}
 
 	return true
@@ -566,13 +622,13 @@ func NotSame(t TestingT, expected, actual interface{}, msgAndArgs ...interface{}
 	same, ok := samePointers(expected, actual)
 	if !ok {
 		// fails when the arguments are not pointers
-		return !(Fail(t, "Both arguments must be pointers", msgAndArgs...))
+		return !(failWithValues(t, "Both arguments must be pointers", expected, actual, msgAndArgs...))
 	}
 
 	if same {
-		return Fail(t, fmt.Sprintf(
+		return failWithValues(t, fmt.Sprintf(
 			"Expected and actual point to the same object: %p %s",
-			expected, truncatingFormat("%#v", expected)), msgAndArgs...)
+			expected, truncatingFormat("%#v", expected)), expected, actual, msgAndArgs...)
 	}
 	return true
 }
@@ -638,11 +694,12 @@ func EqualValues(t TestingT, expected, actual interface{}, msgAndArgs ...interfa
 	}
 
 	if !ObjectsAreEqualValues(expected, actual) {
-		diff := diff(expected, actual)
-		expected, actual = formatUnequalValues(expected, actual)
-		return Fail(t, fmt.Sprintf("Not equal: \n"+
+		rawExpected, rawActual := expected, actual
+		diff := diff(rawExpected, rawActual)
+		expected, actual = formatUnequalValues(rawExpected, rawActual)
+		return failWithValues(t, fmt.Sprintf("Not equal: \n"+
 			"expected: %s\n"+
-			"actual  : %s%s", expected, actual, diff), msgAndArgs...)
+			"actual  : %s%s", expected, actual, diff), rawExpected, rawActual, msgAndArgs...)
 	}
 
 	return true
@@ -663,22 +720,23 @@ func EqualExportedValues(t TestingT, expected, actual interface{}, msgAndArgs ..
 		h.Helper()
 	}
 
+	rawExpected, rawActual := expected, actual
 	aType := reflect.TypeOf(expected)
 	bType := reflect.TypeOf(actual)
 
 	if aType != bType {
-		return Fail(t, fmt.Sprintf("Types expected to match exactly\n\t%v != %v", aType, bType), msgAndArgs...)
+		return failWithValues(t, fmt.Sprintf("Types expected to match exactly\n\t%v != %v", aType, bType), rawExpected, rawActual, msgAndArgs...)
 	}
 
-	expected = copyExportedFields(expected)
-	actual = copyExportedFields(actual)
+	expected = copyExportedFields(rawExpected)
+	actual = copyExportedFields(rawActual)
 
 	if !ObjectsAreEqualValues(expected, actual) {
 		diff := diff(expected, actual)
 		expected, actual = formatUnequalValues(expected, actual)
-		return Fail(t, fmt.Sprintf("Not equal (comparing only exported fields): \n"+
+		return failWithValues(t, fmt.Sprintf("Not equal (comparing only exported fields): \n"+
 			"expected: %s\n"+
-			"actual  : %s%s", expected, actual, diff), msgAndArgs...)
+			"actual  : %s%s", expected, actual, diff), rawExpected, rawActual, msgAndArgs...)
 	}
 
 	return true
@@ -696,7 +754,7 @@ func Exactly(t TestingT, expected, actual interface{}, msgAndArgs ...interface{}
 	bType := reflect.TypeOf(actual)
 
 	if aType != bType {
-		return Fail(t, fmt.Sprintf("Types expected to match exactly\n\t%v != %v", aType, bType), msgAndArgs...)
+		return failWithValues(t, fmt.Sprintf("Types expected to match exactly\n\t%v != %v", aType, bType), expected, actual, msgAndArgs...)
 	}
 
 	return Equal(t, expected, actual, msgAndArgs...)
@@ -712,7 +770,7 @@ func NotNil(t TestingT, object interface{}, msgAndArgs ...interface{}) bool {
 	if h, ok := t.(tHelper); ok {
 		h.Helper()
 	}
-	return Fail(t, "Expected value not to be nil.", msgAndArgs...)
+	return failWithValues(t, "Expected value not to be nil.", nil, object, msgAndArgs...)
 }
 
 // isNil checks if a specified object is nil or not, without Failing.
@@ -744,7 +802,7 @@ func Nil(t TestingT, object interface{}, msgAndArgs ...interface{}) bool {
 	if h, ok := t.(tHelper); ok {
 		h.Helper()
 	}
-	return Fail(t, fmt.Sprintf("Expected nil, but got: %s", truncatingFormat("%#v", object)), msgAndArgs...)
+	return failWithValues(t, fmt.Sprintf("Expected nil, but got: %s", truncatingFormat("%#v", object)), nil, object, msgAndArgs...)
 }
 
 // isEmpty gets whether the specified object is considered empty or not.
@@ -794,7 +852,7 @@ func Empty(t TestingT, object interface{}, msgAndArgs ...interface{}) bool {
 		if h, ok := t.(tHelper); ok {
 			h.Helper()
 		}
-		Fail(t, fmt.Sprintf("Should be empty, but was %s", truncatingFormat("%v", object)), msgAndArgs...)
+		failWithValues(t, fmt.Sprintf("Should be empty, but was %s", truncatingFormat("%v", object)), nil, object, msgAndArgs...)
 	}
 
 	return pass
@@ -811,7 +869,7 @@ func NotEmpty(t TestingT, object interface{}, msgAndArgs ...interface{}) bool {
 		if h, ok := t.(tHelper); ok {
 			h.Helper()
 		}
-		Fail(t, fmt.Sprintf("Should NOT be empty, but was %v", object), msgAndArgs...)
+		failWithValues(t, fmt.Sprintf("Should NOT be empty, but was %v", object), nil, object, msgAndArgs...)
 	}
 
 	return pass
@@ -837,11 +895,11 @@ func Len(t TestingT, object interface{}, length int, msgAndArgs ...interface{}) 
 	}
 	l, ok := getLen(object)
 	if !ok {
-		return Fail(t, fmt.Sprintf("%q could not be applied builtin len()", truncatingFormat("%v", object)), msgAndArgs...)
+		return failWithValues(t, fmt.Sprintf("%q could not be applied builtin len()", truncatingFormat("%v", object)), nil, object, msgAndArgs...)
 	}
 
 	if l != length {
-		return Fail(t, fmt.Sprintf("%q should have %d item(s), but has %d", truncatingFormat("%v", object), length, l), msgAndArgs...)
+		return failWithValues(t, fmt.Sprintf("%q should have %d item(s), but has %d", truncatingFormat("%v", object), length, l), length, object, msgAndArgs...)
 	}
 	return true
 }
@@ -854,7 +912,7 @@ func True(t TestingT, value bool, msgAndArgs ...interface{}) bool {
 		if h, ok := t.(tHelper); ok {
 			h.Helper()
 		}
-		return Fail(t, "Should be true", msgAndArgs...)
+		return failWithValues(t, "Should be true", true, value, msgAndArgs...)
 	}
 
 	return true
@@ -868,7 +926,7 @@ func False(t TestingT, value bool, msgAndArgs ...interface{}) bool {
 		if h, ok := t.(tHelper); ok {
 			h.Helper()
 		}
-		return Fail(t, "Should be false", msgAndArgs...)
+		return failWithValues(t, "Should be false", false, value, msgAndArgs...)
 	}
 
 	return true
@@ -885,12 +943,12 @@ func NotEqual(t TestingT, expected, actual interface{}, msgAndArgs ...interface{
 		h.Helper()
 	}
 	if err := validateEqualArgs(expected, actual); err != nil {
-		return Fail(t, fmt.Sprintf("Invalid operation: %#v != %#v (%s)",
-			expected, actual, err), msgAndArgs...)
+		return failWithValues(t, fmt.Sprintf("Invalid operation: %#v != %#v (%s)",
+			expected, actual, err), expected, actual, msgAndArgs...)
 	}
 
 	if ObjectsAreEqual(expected, actual) {
-		return Fail(t, fmt.Sprintf("Should not be: %s\n", truncatingFormat("%#v", actual)), msgAndArgs...)
+		return failWithValues(t, fmt.Sprintf("Should not be: %s\n", truncatingFormat("%#v", actual)), expected, actual, msgAndArgs...)
 	}
 
 	return true
@@ -905,7 +963,7 @@ func NotEqualValues(t TestingT, expected, actual interface{}, msgAndArgs ...inte
 	}
 
 	if ObjectsAreEqualValues(expected, actual) {
-		return Fail(t, fmt.Sprintf("Should not be: %s\n", truncatingFormat("%#v", actual)), msgAndArgs...)
+		return failWithValues(t, fmt.Sprintf("Should not be: %s\n", truncatingFormat("%#v", actual)), expected, actual, msgAndArgs...)
 	}
 
 	return true
@@ -965,10 +1023,10 @@ func Contains(t TestingT, s, contains interface{}, msgAndArgs ...interface{}) bo
 
 	ok, found := containsElement(s, contains)
 	if !ok {
-		return Fail(t, fmt.Sprintf("%s could not be applied builtin len()", truncatingFormat("%#v", s)), msgAndArgs...)
+		return failWithValues(t, fmt.Sprintf("%s could not be applied builtin len()", truncatingFormat("%#v", s)), contains, s, msgAndArgs...)
 	}
 	if !found {
-		return Fail(t, fmt.Sprintf("%s does not contain %#v", truncatingFormat("%#v", s), contains), msgAndArgs...)
+		return failWithValues(t, fmt.Sprintf("%s does not contain %#v", truncatingFormat("%#v", s), contains), contains, s, msgAndArgs...)
 	}
 
 	return true
@@ -987,10 +1045,10 @@ func NotContains(t TestingT, s, contains interface{}, msgAndArgs ...interface{})
 
 	ok, found := containsElement(s, contains)
 	if !ok {
-		return Fail(t, fmt.Sprintf("%s could not be applied builtin len()", truncatingFormat("%#v", s)), msgAndArgs...)
+		return failWithValues(t, fmt.Sprintf("%s could not be applied builtin len()", truncatingFormat("%#v", s)), contains, s, msgAndArgs...)
 	}
 	if found {
-		return Fail(t, fmt.Sprintf("%s should not contain %#v", truncatingFormat("%#v", s), contains), msgAndArgs...)
+		return failWithValues(t, fmt.Sprintf("%s should not contain %#v", truncatingFormat("%#v", s), contains), contains, s, msgAndArgs...)
 	}
 
 	return true
@@ -1155,7 +1213,7 @@ func ElementsMatch(t TestingT, listA, listB interface{}, msgAndArgs ...interface
 		return true
 	}
 
-	return Fail(t, formatListDiff(listA, listB, extraA, extraB), msgAndArgs...)
+	return failWithValues(t, formatListDiff(listA, listB, extraA, extraB), listB, listA, msgAndArgs...)
 }
 
 // isList checks that the provided value is array or slice.
@@ -1383,7 +1441,7 @@ func WithinDuration(t TestingT, expected, actual time.Time, delta time.Duration,
 
 	dt := expected.Sub(actual)
 	if dt < -delta || dt > delta {
-		return Fail(t, fmt.Sprintf("Max difference between %v and %v allowed is %v, but difference was %v", expected, actual, delta, dt), msgAndArgs...)
+		return failWithValues(t, fmt.Sprintf("Max difference between %v and %v allowed is %v, but difference was %v", expected, actual, delta, dt), expected, actual, msgAndArgs...)
 	}
 
 	return true
@@ -1642,7 +1700,7 @@ func NoError(t TestingT, err error, msgAndArgs ...interface{}) bool {
 		if h, ok := t.(tHelper); ok {
 			h.Helper()
 		}
-		return Fail(t, fmt.Sprintf("Received unexpected error:\n%s", truncatingFormat("%+v", err)), msgAndArgs...)
+		return failWithValues(t, fmt.Sprintf("Received unexpected error:\n%s", truncatingFormat("%+v", err)), nil, err, msgAndArgs...)
 	}
 
 	return true
@@ -1657,7 +1715,7 @@ func Error(t TestingT, err error, msgAndArgs ...interface{}) bool {
 		if h, ok := t.(tHelper); ok {
 			h.Helper()
 		}
-		return Fail(t, "An error is expected but got nil.", msgAndArgs...)
+		return failWithValues(t, "An error is expected but got nil.", nil, err, msgAndArgs...)
 	}
 
 	return true
@@ -1679,9 +1737,9 @@ func EqualError(t TestingT, theError error, errString string, msgAndArgs ...inte
 	actual := theError.Error()
 	// don't need to use deep equals here, we know they are both strings
 	if expected != actual {
-		return Fail(t, fmt.Sprintf("Error message not equal:\n"+
+		return failWithValues(t, fmt.Sprintf("Error message not equal:\n"+
 			"expected: %q\n"+
-			"actual  : %s", expected, truncatingFormat("%q", actual)), msgAndArgs...)
+			"actual  : %s", expected, truncatingFormat("%q", actual)), expected, theError, msgAndArgs...)
 	}
 	return true
 }
@@ -1701,7 +1759,7 @@ func ErrorContains(t TestingT, theError error, contains string, msgAndArgs ...in
 
 	actual := theError.Error()
 	if !strings.Contains(actual, contains) {
-		return Fail(t, fmt.Sprintf("Error %s does not contain %#v", truncatingFormat("%#v", actual), contains), msgAndArgs...)
+		return failWithValues(t, fmt.Sprintf("Error %s does not contain %#v", truncatingFormat("%#v", actual), contains), contains, theError, msgAndArgs...)
 	}
 
 	return true
@@ -2045,10 +2103,47 @@ type CollectT struct {
 	// If it's non-nil but len(c.errors) == 0, this is also a failure
 	// obtained by direct c.FailNow() call.
 	errors []error
+
+	// events collects the structured failure events of one tick. They are
+	// discarded with the CollectT when the condition succeeds and are
+	// forwarded to parent by EventuallyWithT only when the wait times out,
+	// so transient polling failures never produce events.
+	events []FailureEvent
+
+	// parent is the TestingT of the owning test. It keeps the test context
+	// (Name) and receives the collected events on timeout.
+	parent TestingT
+}
+
+// newCollectT creates a CollectT bound to the owning test.
+func newCollectT(parent TestingT) *CollectT {
+	return &CollectT{parent: parent}
 }
 
 // Helper is like [testing.T.Helper] but does nothing.
 func (CollectT) Helper() {}
+
+// Name returns the name of the owning test, so failures observed inside an
+// EventuallyWithT condition keep their test context.
+func (c *CollectT) Name() string {
+	if c.parent != nil {
+		if n, ok := c.parent.(interface{ Name() string }); ok {
+			return n.Name()
+		}
+	}
+	return ""
+}
+
+// OnAssertionFailure implements [FailureEventSink]. Failures of one tick are
+// collected instead of being delivered immediately; they only surface when
+// EventuallyWithT times out. A require/FailNow failure inside a condition
+// only aborts the tick goroutine, never the owning test, so the collected
+// event is normalized to non-fatal; the timeout event carries the real
+// terminal flag.
+func (c *CollectT) OnAssertionFailure(event FailureEvent) {
+	event.Fatal = false
+	c.events = append(c.events, event)
+}
 
 // Errorf collects the error.
 func (c *CollectT) Errorf(format string, args ...interface{}) {
@@ -2105,10 +2200,11 @@ func EventuallyWithT(t TestingT, condition func(collect *CollectT), waitFor time
 	}
 
 	var lastFinishedTickErrs []error
+	var lastFinishedTickEvents []FailureEvent
 	ch := make(chan *CollectT, 1)
 
 	checkCond := func() {
-		collect := new(CollectT)
+		collect := newCollectT(t)
 		defer func() {
 			ch <- collect
 		}()
@@ -2132,6 +2228,15 @@ func EventuallyWithT(t TestingT, condition func(collect *CollectT), waitFor time
 			for _, err := range lastFinishedTickErrs {
 				t.Errorf("%v", err)
 			}
+			// Forward the structured failures of the last tick before the
+			// outer "Condition never satisfied" event, mirroring the text
+			// output order. Failures from earlier, eventually successful
+			// ticks were dropped together with their CollectT.
+			if sink, ok := t.(FailureEventSink); ok {
+				for _, event := range lastFinishedTickEvents {
+					sink.OnAssertionFailure(event)
+				}
+			}
 			return Fail(t, "Condition never satisfied", msgAndArgs...)
 		case <-tickC:
 			tickC = nil
@@ -2142,6 +2247,7 @@ func EventuallyWithT(t TestingT, condition func(collect *CollectT), waitFor time
 			}
 			// Keep the errors from the last ended condition, so that they can be copied to t if timeout is reached.
 			lastFinishedTickErrs = collect.errors
+			lastFinishedTickEvents = collect.events
 			tickC = ticker.C
 		}
 	}
@@ -2200,16 +2306,16 @@ func ErrorIs(t TestingT, err, target error, msgAndArgs ...interface{}) bool {
 	if target != nil {
 		expectedText = target.Error()
 		if err == nil {
-			return Fail(t, fmt.Sprintf("Expected error with %q in chain but got nil.", expectedText), msgAndArgs...)
+			return failWithValues(t, fmt.Sprintf("Expected error with %q in chain but got nil.", expectedText), target, err, msgAndArgs...)
 		}
 	}
 
 	chain := buildErrorChainString(err, false)
 
-	return Fail(t, fmt.Sprintf("Target error should be in err chain:\n"+
+	return failWithValues(t, fmt.Sprintf("Target error should be in err chain:\n"+
 		"expected: %s\n"+
 		"in chain: %s", truncatingFormat("%q", expectedText), truncatingFormat("%s", chain),
-	), msgAndArgs...)
+	), target, err, msgAndArgs...)
 }
 
 // NotErrorIs asserts that none of the errors in err's chain matches target.
@@ -2229,10 +2335,10 @@ func NotErrorIs(t TestingT, err, target error, msgAndArgs ...interface{}) bool {
 
 	chain := buildErrorChainString(err, false)
 
-	return Fail(t, fmt.Sprintf("Target error should not be in err chain:\n"+
+	return failWithValues(t, fmt.Sprintf("Target error should not be in err chain:\n"+
 		"found: %s\n"+
 		"in chain: %s", truncatingFormat("%q", expectedText), truncatingFormat("%s", chain),
-	), msgAndArgs...)
+	), target, err, msgAndArgs...)
 }
 
 // ErrorAs asserts that at least one of the errors in err's chain matches target, and if so, sets target to that error value.
@@ -2247,16 +2353,16 @@ func ErrorAs(t TestingT, err error, target interface{}, msgAndArgs ...interface{
 
 	expectedType := reflect.TypeOf(target).Elem().String()
 	if err == nil {
-		return Fail(t, fmt.Sprintf("An error is expected but got nil.\n"+
-			"expected: %s", expectedType), msgAndArgs...)
+		return failWithValues(t, fmt.Sprintf("An error is expected but got nil.\n"+
+			"expected: %s", expectedType), target, err, msgAndArgs...)
 	}
 
 	chain := buildErrorChainString(err, true)
 
-	return Fail(t, fmt.Sprintf("Should be in error chain:\n"+
+	return failWithValues(t, fmt.Sprintf("Should be in error chain:\n"+
 		"expected: %s\n"+
 		"in chain: %s", expectedType, truncatingFormat("%s", chain),
-	), msgAndArgs...)
+	), target, err, msgAndArgs...)
 }
 
 // NotErrorAs asserts that none of the errors in err's chain matches target,
