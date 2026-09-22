@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/stretchr/objx"
 
@@ -305,6 +306,12 @@ type Mock struct {
 	// Holds the calls that were made to this mocked object.
 	Calls []Call
 
+	// callLog is an append-only stream of immutable call snapshots with stable
+	// sequence numbers. It backs read-only checkpoints and is never trimmed or
+	// reordered, so checkpoints can neither change recorded history nor affect
+	// expectations.
+	callLog []RecordedCall
+
 	// test is An optional variable that holds the test struct, to be used when an
 	// invalid mock call was made.
 	test TestingT
@@ -555,6 +562,15 @@ func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Argumen
 
 	// add the call
 	m.Calls = append(m.Calls, *newCall(m, methodName, assert.CallerInfo(), arguments, call.ReturnArguments))
+	// add a read-only snapshot with a stable sequence number. Appended in the
+	// same critical section as Calls, so it shares the same goroutine-safe
+	// total order and never changes the existing call record or expectation
+	// counters.
+	m.callLog = append(m.callLog, RecordedCall{
+		Seq:       len(m.callLog) + 1,
+		Method:    methodName,
+		Arguments: snapshotArguments(arguments),
+	})
 	m.mutex.Unlock()
 
 	// block if specified
@@ -774,6 +790,350 @@ func (m *Mock) expectedCalls() []*Call {
 
 func (m *Mock) calls() []Call {
 	return append([]Call{}, m.Calls...)
+}
+
+/*
+	Read-only checkpoints
+*/
+
+// RecordedCall is an immutable snapshot of a single method call captured at the
+// moment the call was recorded. Values of this type are returned by
+// [Checkpoint.CallsSince].
+//
+// The Arguments field holds a deep snapshot of the call arguments: later
+// mutations of the original argument objects (including mutations performed by
+// a [Call.RunFn] handler) do not affect it. Every read returns fresh copies, so
+// mutating a returned RecordedCall never affects later reads.
+type RecordedCall struct {
+	// Seq is the stable, 1-based sequence number of the call within the Mock's
+	// lifetime. The first call recorded by the Mock has Seq 1; the numbers are
+	// dense, strictly increasing and never reused.
+	Seq int
+
+	// Method is the name of the called method.
+	Method string
+
+	// Arguments is the deep snapshot of the call arguments.
+	Arguments Arguments
+}
+
+// MethodInvocation describes one expected method call for
+// [Checkpoint.AssertCallsSince]. Arguments may use [Anything],
+// [AnythingOfType], [MatchedBy] and the other argument matchers, exactly like
+// [Mock.On].
+type MethodInvocation struct {
+	// Method is the name of the expected method.
+	Method string
+
+	// Arguments are the expected arguments.
+	Arguments Arguments
+}
+
+// Invocation builds a [MethodInvocation] for use with
+// [Checkpoint.AssertCallsSince].
+//
+//	checkPoint.AssertCallsSince(t,
+//	    mock.Invocation("MethodA", 1),
+//	    mock.Invocation("MethodB", "x"),
+//	)
+func Invocation(methodName string, arguments ...interface{}) MethodInvocation {
+	return MethodInvocation{Method: methodName, Arguments: arguments}
+}
+
+// Checkpoint is a read-only position in a Mock's call history. Checkpoints
+// never modify expectations or recorded history: they neither clear the call
+// records nor change expectation counters, and they never affect
+// [Mock.AssertExpectations].
+//
+// A checkpoint stays valid for the whole lifetime of the Mock. Checkpoints may
+// be nested freely: each one observes the calls recorded after itself,
+// independently of any other checkpoint, and its increment range never shifts.
+type Checkpoint struct {
+	parent *Mock
+
+	// seq is the number of calls already recorded when the checkpoint was
+	// taken.
+	seq int
+}
+
+// Checkpoint records a read-only checkpoint at the Mock's current call
+// position. It is safe for concurrent use and changes neither expectations nor
+// recorded calls.
+func (m *Mock) Checkpoint() *Checkpoint {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	return &Checkpoint{parent: m, seq: len(m.callLog)}
+}
+
+// Seq returns the checkpoint position as the number of calls that had already
+// been recorded when the checkpoint was taken. Every [RecordedCall] returned by
+// [Checkpoint.CallsSince] has a Seq strictly greater than this value. The value
+// is stable for the whole lifetime of the Mock.
+func (c *Checkpoint) Seq() int {
+	return c.seq
+}
+
+// CallsSince returns the calls recorded after the checkpoint, in the total
+// order in which they were recorded by the Mock (a goroutine-safe linear
+// order). It returns fresh deep copies of the snapshots, so the result can be
+// mutated freely and re-reading after a failed assertion always yields the same
+// values. It returns nil when no call was recorded after the checkpoint.
+func (c *Checkpoint) CallsSince() []RecordedCall {
+	c.parent.mutex.Lock()
+	defer c.parent.mutex.Unlock()
+	return c.callsSinceLocked()
+}
+
+// callsSinceLocked must be called with the parent Mock's mutex held.
+func (c *Checkpoint) callsSinceLocked() []RecordedCall {
+	increment := c.parent.callLog[c.seq:]
+	if len(increment) == 0 {
+		return nil
+	}
+	out := make([]RecordedCall, len(increment))
+	for i, rec := range increment {
+		out[i] = RecordedCall{
+			Seq:       rec.Seq,
+			Method:    rec.Method,
+			Arguments: snapshotArguments(rec.Arguments),
+		}
+	}
+	return out
+}
+
+// NumberOfCallsSince returns the number of calls to the given method recorded
+// after the checkpoint.
+func (c *Checkpoint) NumberOfCallsSince(methodName string) int {
+	c.parent.mutex.Lock()
+	defer c.parent.mutex.Unlock()
+	var n int
+	for _, rec := range c.parent.callLog[c.seq:] {
+		if rec.Method == methodName {
+			n++
+		}
+	}
+	return n
+}
+
+// AssertNumberOfCallsSince asserts that the given method was called
+// expectedCalls times after the checkpoint.
+func (c *Checkpoint) AssertNumberOfCallsSince(t TestingT, methodName string, expectedCalls int) bool {
+	if h, ok := t.(tHelper); ok {
+		h.Helper()
+	}
+	actualCalls := c.NumberOfCallsSince(methodName)
+	return assert.Equal(t, expectedCalls, actualCalls, fmt.Sprintf("Expected number of calls (%d) of method %s since the checkpoint does not match the actual number of calls (%d).", expectedCalls, methodName, actualCalls))
+}
+
+// AssertCalledSince asserts that the given method was called after the
+// checkpoint with the given arguments. Arguments may use the mock argument
+// matchers.
+func (c *Checkpoint) AssertCalledSince(t TestingT, methodName string, arguments ...interface{}) bool {
+	if h, ok := t.(tHelper); ok {
+		h.Helper()
+	}
+	c.parent.mutex.Lock()
+	defer c.parent.mutex.Unlock()
+	for _, rec := range c.parent.callLog[c.seq:] {
+		if rec.Method == methodName {
+			if _, differences := Arguments(arguments).Diff(rec.Arguments); differences == 0 {
+				return true
+			}
+		}
+	}
+	return assert.Fail(t, "Should have called with given arguments",
+		fmt.Sprintf("Expected %q to have been called since the checkpoint with:\n%v\nbut no matching call happened.", methodName, arguments))
+}
+
+// AssertNotCalledSince asserts that the given method was not called after the
+// checkpoint with the given arguments. Arguments may use the mock argument
+// matchers.
+func (c *Checkpoint) AssertNotCalledSince(t TestingT, methodName string, arguments ...interface{}) bool {
+	if h, ok := t.(tHelper); ok {
+		h.Helper()
+	}
+	c.parent.mutex.Lock()
+	defer c.parent.mutex.Unlock()
+	for _, rec := range c.parent.callLog[c.seq:] {
+		if rec.Method == methodName {
+			if _, differences := Arguments(arguments).Diff(rec.Arguments); differences == 0 {
+				return assert.Fail(t, "Should not have called with given arguments",
+					fmt.Sprintf("Expected %q to not have been called since the checkpoint with:\n%v\nbut actually it was (seq %d).", methodName, arguments, rec.Seq))
+			}
+		}
+	}
+	return true
+}
+
+// AssertCallsSince asserts that exactly the given method invocations were
+// recorded after the checkpoint: in the declared order, with matching
+// arguments and without any extra call. Arguments may use the mock argument
+// matchers.
+func (c *Checkpoint) AssertCallsSince(t TestingT, expectedCalls ...MethodInvocation) bool {
+	if h, ok := t.(tHelper); ok {
+		h.Helper()
+	}
+	actualCalls := c.CallsSince()
+
+	success := true
+
+	if len(actualCalls) != len(expectedCalls) {
+		success = false
+		t.Errorf("Expected %d call(s) since the checkpoint but got %d.", len(expectedCalls), len(actualCalls))
+	}
+
+	for i := 0; i < len(expectedCalls) && i < len(actualCalls); i++ {
+		expected, actual := expectedCalls[i], actualCalls[i]
+		if actual.Method != expected.Method {
+			success = false
+			t.Errorf("Call #%d (seq %d): expected method %q but got %q.", i+1, actual.Seq, expected.Method, actual.Method)
+			continue
+		}
+		diff, differences := expected.Arguments.Diff(actual.Arguments)
+		if differences != 0 {
+			success = false
+			t.Errorf("Call #%d (seq %d) to %q does not match arguments:\n%s\nExpected: %v\nActual:   %v",
+				i+1, actual.Seq, actual.Method, strings.TrimSpace(diff), expected.Arguments, actual.Arguments)
+		}
+	}
+
+	return success
+}
+
+// snapshotArguments returns a deep copy of the given arguments so that later
+// mutations of mutable argument objects cannot change a recorded snapshot.
+// Snapshotting is best effort and must never break a mock call: values that
+// cannot be copied are kept by reference.
+func snapshotArguments(arguments Arguments) Arguments {
+	if len(arguments) == 0 {
+		return nil
+	}
+	snap := make(Arguments, len(arguments))
+	for i, arg := range arguments {
+		snap[i] = deepCopyArgument(arg)
+	}
+	return snap
+}
+
+// mockArgumentMarker is implemented by every type embedding Mock. A mock passed
+// as a call argument to another mock is kept by reference: traversing into its
+// internals would race with the mock's own concurrent activity (its state is
+// protected by its private mutex), and locking a foreign mock could deadlock on
+// cross-mock calls.
+type mockArgumentMarker interface {
+	isMockCallArgument()
+}
+
+// isMockCallArgument marks Mock (and every type embedding it) as an argument
+// that must be shared rather than deep-snapshotted.
+func (*Mock) isMockCallArgument() {}
+
+// deepCopyArgument deep-copies src through reflection, preserving pointer and
+// map aliasing (including cyclic structures). Any failure falls back to
+// returning src, so snapshotting can never change the behavior of a mock call.
+func deepCopyArgument(src interface{}) (dst interface{}) {
+	if src == nil {
+		return nil
+	}
+	defer func() {
+		if recover() != nil {
+			dst = src
+		}
+	}()
+	visited := make(map[unsafe.Pointer]reflect.Value)
+	copied := deepCopyReflect(reflect.ValueOf(src), visited)
+	if !copied.IsValid() {
+		return src
+	}
+	return copied.Interface()
+}
+
+// deepCopyReflect returns an independent copy of v. visited maps the pointer
+// identity of pointer and map values to their copies, which preserves aliasing
+// and terminates recursion on cyclic values. Unexported struct fields cannot be
+// reached and are shared with the source.
+func deepCopyReflect(v reflect.Value, visited map[unsafe.Pointer]reflect.Value) reflect.Value {
+	if !v.IsValid() {
+		return v
+	}
+	switch v.Kind() {
+	case reflect.Ptr:
+		if v.IsNil() {
+			return v
+		}
+		// Mocks passed as arguments keep their existing by-reference
+		// behavior; their internals are protected by their own mutex.
+		if v.CanInterface() {
+			if _, ok := v.Interface().(mockArgumentMarker); ok {
+				return v
+			}
+		}
+		key := unsafe.Pointer(v.Pointer())
+		if c, ok := visited[key]; ok {
+			return c
+		}
+		nv := reflect.New(v.Type().Elem())
+		visited[key] = nv
+		nv.Elem().Set(deepCopyReflect(v.Elem(), visited))
+		return nv
+	case reflect.Interface:
+		if v.IsNil() {
+			return v
+		}
+		nv := reflect.New(v.Type()).Elem()
+		nv.Set(deepCopyReflect(v.Elem(), visited))
+		return nv
+	case reflect.Struct:
+		nv := reflect.New(v.Type()).Elem()
+		// Copying the whole value also copies unexported fields (which cannot
+		// be set individually).
+		nv.Set(v)
+		for i := 0; i < nv.NumField(); i++ {
+			f := nv.Field(i)
+			if !f.CanInterface() || !f.CanSet() {
+				continue
+			}
+			switch f.Kind() {
+			case reflect.Ptr, reflect.Interface, reflect.Slice, reflect.Map, reflect.Array, reflect.Struct:
+				f.Set(deepCopyReflect(f, visited))
+			}
+		}
+		return nv
+	case reflect.Slice:
+		if v.IsNil() {
+			return v
+		}
+		nv := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
+		for i := 0; i < v.Len(); i++ {
+			nv.Index(i).Set(deepCopyReflect(v.Index(i), visited))
+		}
+		return nv
+	case reflect.Array:
+		nv := reflect.New(v.Type()).Elem()
+		for i := 0; i < v.Len(); i++ {
+			nv.Index(i).Set(deepCopyReflect(v.Index(i), visited))
+		}
+		return nv
+	case reflect.Map:
+		if v.IsNil() {
+			return v
+		}
+		key := unsafe.Pointer(v.Pointer())
+		if c, ok := visited[key]; ok {
+			return c
+		}
+		nv := reflect.MakeMap(v.Type())
+		visited[key] = nv
+		iter := v.MapRange()
+		for iter.Next() {
+			nv.SetMapIndex(deepCopyReflect(iter.Key(), visited), deepCopyReflect(iter.Value(), visited))
+		}
+		return nv
+	default:
+		// Numbers, bool, string, complex: immutable. Chan, func,
+		// unsafe.Pointer: opaque references shared with the source.
+		return v
+	}
 }
 
 /*
