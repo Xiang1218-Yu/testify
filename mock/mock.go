@@ -355,10 +355,18 @@ func (m *Mock) fail(format string, args ...interface{}) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
+	message := fmt.Sprintf(format, args...)
 	if m.test == nil {
-		panic(fmt.Sprintf(format, args...))
+		panic(message)
 	}
-	m.test.Errorf(format, args...)
+	// Report through the structured failure pipeline so that renderers and
+	// failure observers cover mock failures as well. Preformatted keeps the
+	// historical raw mock output under the default text renderer.
+	assert.FailWith(m.test, assert.FailureOptions{
+		Assertion:    "Mock",
+		Fatal:        true,
+		Preformatted: true,
+	}, message)
 	m.test.FailNow()
 }
 
@@ -605,7 +613,10 @@ func AssertExpectationsForObjects(t TestingT, testObjects ...interface{}) bool {
 	for _, obj := range testObjects {
 		m, ok := obj.(assertExpectationiser)
 		if !ok {
-			t.Errorf("Invalid test object type %T. Expected reference to a mock.Mock, eg: 'AssertExpectationsForObjects(t, myMock)' or 'AssertExpectationsForObjects(t, &myMock.Mock)'", obj)
+			assert.FailWith(t, assert.FailureOptions{
+				Assertion:    "Mock.AssertExpectationsForObjects",
+				Preformatted: true,
+			}, fmt.Sprintf("Invalid test object type %T. Expected reference to a mock.Mock, eg: 'AssertExpectationsForObjects(t, myMock)' or 'AssertExpectationsForObjects(t, &myMock.Mock)'", obj))
 			continue
 
 		}
@@ -642,7 +653,12 @@ func (m *Mock) AssertExpectations(t TestingT) bool {
 	}
 
 	if failedExpectations != 0 {
-		t.Errorf("FAIL: %d out of %d expectation(s) were met.\n\tThe code you are testing needs to make %d more call(s).\n\tat: %s", len(expectedCalls)-failedExpectations, len(expectedCalls), failedExpectations, assert.CallerInfo())
+		assert.FailWith(t, assert.FailureOptions{
+			Assertion:    "Mock.AssertExpectations",
+			Expected:     len(expectedCalls),
+			Actual:       len(expectedCalls) - failedExpectations,
+			Preformatted: true,
+		}, fmt.Sprintf("FAIL: %d out of %d expectation(s) were met.\n\tThe code you are testing needs to make %d more call(s).\n\tat: %s", len(expectedCalls)-failedExpectations, len(expectedCalls), failedExpectations, assert.CallerInfo()))
 	}
 
 	return failedExpectations == 0
@@ -1100,7 +1116,12 @@ func (args Arguments) Assert(t TestingT, objects ...interface{}) bool {
 
 	// there are differences... report them...
 	t.Logf(diff)
-	t.Errorf("%sArguments do not match.", assert.CallerInfo())
+	assert.FailWith(t, assert.FailureOptions{
+		Assertion:    "Mock.Arguments.Assert",
+		Expected:     objects,
+		Actual:       args,
+		Preformatted: true,
+	}, fmt.Sprintf("%sArguments do not match.", assert.CallerInfo()))
 
 	return false
 }

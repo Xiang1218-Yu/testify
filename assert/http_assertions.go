@@ -103,7 +103,7 @@ func HTTPStatusCode(t TestingT, handler http.HandlerFunc, method, url string, va
 
 	successful := code == statuscode
 	if !successful {
-		Fail(t, fmt.Sprintf("Expected HTTP status code %d for %q but received %d", statuscode, url+"?"+values.Encode(), code), msgAndArgs...)
+		failWithValues(t, statuscode, code, fmt.Sprintf("Expected HTTP status code %d for %q but received %d", statuscode, url+"?"+values.Encode(), code), msgAndArgs...)
 	}
 
 	return successful

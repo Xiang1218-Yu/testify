@@ -227,6 +227,19 @@ func FailNowf(t TestingT, failureMessage string, msg string, args ...interface{}
 	return FailNow(t, failureMessage, append([]interface{}{msg}, args...)...)
 }
 
+// FailWithf is the structured failure entry point. It behaves like [Fail] -
+// it reports the failure through t.Errorf and returns false - but additionally
+// records structured metadata in the immutable [FailureRecord] and lets the
+// current test context select how the failure is rendered. It is intended for
+// code outside the assertion functions (such as mock) and for custom
+// assertion helpers.
+func FailWithf(t TestingT, opts FailureOptions, failureMessage string, msg string, args ...interface{}) bool {
+	if h, ok := t.(tHelper); ok {
+		h.Helper()
+	}
+	return FailWith(t, opts, failureMessage, append([]interface{}{msg}, args...)...)
+}
+
 // Falsef asserts that the specified value is false.
 //
 //	assert.Falsef(t, myBool, "error message %s", "formatted")

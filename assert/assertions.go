@@ -347,7 +347,9 @@ func FailNow(t TestingT, failureMessage string, msgAndArgs ...interface{}) bool 
 	if h, ok := t.(tHelper); ok {
 		h.Helper()
 	}
-	Fail(t, failureMessage, msgAndArgs...)
+	// Build and render the immutable record with fatal semantics, then stop
+	// test execution exactly as before.
+	reportFailure(t, FailureOptions{Fatal: true}, failureMessage, msgAndArgs...)
 
 	// We cannot extend TestingT with FailNow() and
 	// maintain backwards compatibility, so we fallback
@@ -368,26 +370,90 @@ func Fail(t TestingT, failureMessage string, msgAndArgs ...interface{}) bool {
 	if h, ok := t.(tHelper); ok {
 		h.Helper()
 	}
-	content := []labeledContent{
-		{"Error Trace", strings.Join(CallerInfo(), "\n\t\t\t")},
-		{"Error", failureMessage},
+	// The immutable failure record is constructed inside reportFailure and
+	// rendered by the renderer selected by the current test context. The
+	// default text renderer produces the same labeled output this function
+	// used to build inline.
+	return reportFailure(t, FailureOptions{}, failureMessage, msgAndArgs...)
+}
+
+// reportFailure is the unique place where a failure becomes an immutable
+// [FailureRecord], is observed by the test context, rendered through the
+// renderer selected by that context and finally reported. Assertion
+// functions, [Fail], [FailNow], [FailWith] and external helpers such as mock
+// all funnel through it, so the terminal output, JSON output and any custom
+// rendering always describe the exact same record.
+//
+// It lives in assertions.go (rather than failure_record.go) so that
+// file:line attribution performed by testing.T and TestingT implementations
+// that simulate its decoration stays identical to the historical inline
+// reporting of [Fail].
+func reportFailure(t TestingT, opts FailureOptions, failureMessage string, msgAndArgs ...interface{}) bool {
+	if h, ok := t.(tHelper); ok {
+		h.Helper()
+	}
+	assertion, fatal := failureOrigin()
+	if opts.Assertion != "" {
+		assertion = opts.Assertion
+	}
+	if opts.Fatal {
+		fatal = true
 	}
 
-	// Add test name if the Go version supports it
+	record := &FailureRecord{
+		assertion:    assertion,
+		message:      failureMessage,
+		extraMessage: messageFromMsgAndArgs(msgAndArgs...),
+		callers:      append([]string(nil), CallerInfo()...),
+		expected:     opts.Expected,
+		actual:       opts.Actual,
+		fatal:        fatal,
+		preformatted: opts.Preformatted,
+		at:           time.Now(),
+	}
 	if n, ok := t.(interface {
 		Name() string
 	}); ok {
-		content = append(content, labeledContent{"Test", n.Name()})
+		record.testName = n.Name()
 	}
 
-	message := messageFromMsgAndArgs(msgAndArgs...)
-	if len(message) > 0 {
-		content = append(content, labeledContent{"Messages", message})
+	// Give machine oriented consumers the immutable record first. A panicking
+	// observer must never swallow or alter the original failure.
+	if observer, ok := t.(FailureObserver); ok {
+		func() {
+			defer func() { _ = recover() }()
+			observer.ObserveFailure(record)
+		}()
 	}
 
-	t.Errorf("\n%s", ""+labeledOutput(content...))
+	renderer := FailureRenderer(NewTextFailureRenderer())
+	if provider, ok := t.(FailureRendererProvider); ok {
+		if r := provider.FailureRenderer(); r != nil {
+			renderer = r
+		}
+	}
 
+	reportRenderedFailure(t, record.preformatted, safeRenderFailure(renderer, record))
 	return false
+}
+
+// reportRenderedFailure is the unique TestingT.Errorf call site of the failure
+// pipeline. It lives in assertions.go and is marked as a test helper so that
+// failure attribution (file:line decoration performed by testing.T) is
+// identical to the historical inline reporting of [Fail]. It must not be
+// inlined, otherwise the file:line of the Errorf call moves back into the
+// failure pipeline and testing.T decoration changes.
+//
+//go:noinline
+func reportRenderedFailure(t TestingT, preformatted bool, output string) {
+	if h, ok := t.(tHelper); ok {
+		h.Helper()
+	}
+	if preformatted {
+		t.Errorf("%s", output)
+	} else {
+		t.Errorf("\n%s", output)
+	}
 }
 
 type labeledContent struct {
@@ -504,10 +570,10 @@ func Equal(t TestingT, expected, actual interface{}, msgAndArgs ...interface{}) 
 
 	if !ObjectsAreEqual(expected, actual) {
 		diff := diff(expected, actual)
-		expected, actual = formatUnequalValues(expected, actual)
-		return Fail(t, fmt.Sprintf("Not equal: \n"+
+		expectedStr, actualStr := formatUnequalValues(expected, actual)
+		return failWithValues(t, expected, actual, fmt.Sprintf("Not equal: \n"+
 			"expected: %s\n"+
-			"actual  : %s%s", expected, actual, diff), msgAndArgs...)
+			"actual  : %s%s", expectedStr, actualStr, diff), msgAndArgs...)
 	}
 
 	return true
@@ -544,7 +610,7 @@ func Same(t TestingT, expected, actual interface{}, msgAndArgs ...interface{}) b
 
 	if !same {
 		// both are pointers but not the same type & pointing to the same address
-		return Fail(t, fmt.Sprintf("Not same: \n"+
+		return failWithValues(t, expected, actual, fmt.Sprintf("Not same: \n"+
 			"expected: %[2]s (%[1]T)(%[1]p)\n"+
 			"actual  : %[4]s (%[3]T)(%[3]p)", expected, truncatingFormat("%#v", expected), actual, truncatingFormat("%#v", actual)), msgAndArgs...)
 	}
@@ -639,10 +705,10 @@ func EqualValues(t TestingT, expected, actual interface{}, msgAndArgs ...interfa
 
 	if !ObjectsAreEqualValues(expected, actual) {
 		diff := diff(expected, actual)
-		expected, actual = formatUnequalValues(expected, actual)
-		return Fail(t, fmt.Sprintf("Not equal: \n"+
+		expectedStr, actualStr := formatUnequalValues(expected, actual)
+		return failWithValues(t, expected, actual, fmt.Sprintf("Not equal: \n"+
 			"expected: %s\n"+
-			"actual  : %s%s", expected, actual, diff), msgAndArgs...)
+			"actual  : %s%s", expectedStr, actualStr, diff), msgAndArgs...)
 	}
 
 	return true
@@ -712,7 +778,7 @@ func NotNil(t TestingT, object interface{}, msgAndArgs ...interface{}) bool {
 	if h, ok := t.(tHelper); ok {
 		h.Helper()
 	}
-	return Fail(t, "Expected value not to be nil.", msgAndArgs...)
+	return failWithValues(t, "non-nil value", object, "Expected value not to be nil.", msgAndArgs...)
 }
 
 // isNil checks if a specified object is nil or not, without Failing.
@@ -744,7 +810,7 @@ func Nil(t TestingT, object interface{}, msgAndArgs ...interface{}) bool {
 	if h, ok := t.(tHelper); ok {
 		h.Helper()
 	}
-	return Fail(t, fmt.Sprintf("Expected nil, but got: %s", truncatingFormat("%#v", object)), msgAndArgs...)
+	return failWithValues(t, nil, object, fmt.Sprintf("Expected nil, but got: %s", truncatingFormat("%#v", object)), msgAndArgs...)
 }
 
 // isEmpty gets whether the specified object is considered empty or not.
@@ -841,7 +907,7 @@ func Len(t TestingT, object interface{}, length int, msgAndArgs ...interface{}) 
 	}
 
 	if l != length {
-		return Fail(t, fmt.Sprintf("%q should have %d item(s), but has %d", truncatingFormat("%v", object), length, l), msgAndArgs...)
+		return failWithValues(t, length, l, fmt.Sprintf("%q should have %d item(s), but has %d", truncatingFormat("%v", object), length, l), msgAndArgs...)
 	}
 	return true
 }
@@ -854,7 +920,7 @@ func True(t TestingT, value bool, msgAndArgs ...interface{}) bool {
 		if h, ok := t.(tHelper); ok {
 			h.Helper()
 		}
-		return Fail(t, "Should be true", msgAndArgs...)
+		return failWithValues(t, true, value, "Should be true", msgAndArgs...)
 	}
 
 	return true
@@ -868,7 +934,7 @@ func False(t TestingT, value bool, msgAndArgs ...interface{}) bool {
 		if h, ok := t.(tHelper); ok {
 			h.Helper()
 		}
-		return Fail(t, "Should be false", msgAndArgs...)
+		return failWithValues(t, false, value, "Should be false", msgAndArgs...)
 	}
 
 	return true
@@ -890,7 +956,7 @@ func NotEqual(t TestingT, expected, actual interface{}, msgAndArgs ...interface{
 	}
 
 	if ObjectsAreEqual(expected, actual) {
-		return Fail(t, fmt.Sprintf("Should not be: %s\n", truncatingFormat("%#v", actual)), msgAndArgs...)
+		return failWithValues(t, expected, actual, fmt.Sprintf("Should not be: %s\n", truncatingFormat("%#v", actual)), msgAndArgs...)
 	}
 
 	return true
@@ -1642,7 +1708,7 @@ func NoError(t TestingT, err error, msgAndArgs ...interface{}) bool {
 		if h, ok := t.(tHelper); ok {
 			h.Helper()
 		}
-		return Fail(t, fmt.Sprintf("Received unexpected error:\n%s", truncatingFormat("%+v", err)), msgAndArgs...)
+		return failWithValues(t, nil, err, fmt.Sprintf("Received unexpected error:\n%s", truncatingFormat("%+v", err)), msgAndArgs...)
 	}
 
 	return true
@@ -1657,7 +1723,7 @@ func Error(t TestingT, err error, msgAndArgs ...interface{}) bool {
 		if h, ok := t.(tHelper); ok {
 			h.Helper()
 		}
-		return Fail(t, "An error is expected but got nil.", msgAndArgs...)
+		return failWithValues(t, "non-nil error", nil, "An error is expected but got nil.", msgAndArgs...)
 	}
 
 	return true

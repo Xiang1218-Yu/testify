@@ -438,6 +438,32 @@ func (a *Assertions) FailNowf(failureMessage string, msg string, args ...interfa
 	return FailNowf(a.t, failureMessage, msg, args...)
 }
 
+// FailWith is the structured failure entry point. It behaves like [Fail] -
+// it reports the failure through t.Errorf and returns false - but additionally
+// records structured metadata in the immutable [FailureRecord] and lets the
+// current test context select how the failure is rendered. It is intended for
+// code outside the assertion functions (such as mock) and for custom
+// assertion helpers.
+func (a *Assertions) FailWith(opts FailureOptions, failureMessage string, msgAndArgs ...interface{}) bool {
+	if h, ok := a.t.(tHelper); ok {
+		h.Helper()
+	}
+	return FailWith(a.t, opts, failureMessage, msgAndArgs...)
+}
+
+// FailWithf is the structured failure entry point. It behaves like [Fail] -
+// it reports the failure through t.Errorf and returns false - but additionally
+// records structured metadata in the immutable [FailureRecord] and lets the
+// current test context select how the failure is rendered. It is intended for
+// code outside the assertion functions (such as mock) and for custom
+// assertion helpers.
+func (a *Assertions) FailWithf(opts FailureOptions, failureMessage string, msg string, args ...interface{}) bool {
+	if h, ok := a.t.(tHelper); ok {
+		h.Helper()
+	}
+	return FailWithf(a.t, opts, failureMessage, msg, args...)
+}
+
 // Failf reports a failure through
 func (a *Assertions) Failf(failureMessage string, msg string, args ...interface{}) bool {
 	if h, ok := a.t.(tHelper); ok {
