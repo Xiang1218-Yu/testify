@@ -29,6 +29,26 @@ type Suite struct {
 
 	// Parent suite to have access to the implemented methods of parent struct
 	s TestingSuite
+
+	// observer is the execution observer attached to the enclosing
+	// package level run. It is nil unless the suite is run through
+	// RunObserved, and it is scoped (saved and restored) across nested
+	// runs so subtests of one suite can never report into another.
+	observer *executionObserver
+}
+
+// currentExecutionObserver implements observerCarrier.
+func (suite *Suite) currentExecutionObserver() *executionObserver {
+	suite.mu.RLock()
+	defer suite.mu.RUnlock()
+	return suite.observer
+}
+
+// setExecutionObserver implements observerCarrier.
+func (suite *Suite) setExecutionObserver(observer *executionObserver) {
+	suite.mu.Lock()
+	defer suite.mu.Unlock()
+	suite.observer = observer
 }
 
 // T retrieves the current *testing.T context.
@@ -101,22 +121,51 @@ func failOnPanic(t *testing.T, r interface{}) {
 // Provides compatibility with go test pkg -run TestSuite/TestName/SubTestName.
 func (suite *Suite) Run(name string, subtest func()) bool {
 	oldT := suite.T()
+	obs := suite.currentExecutionObserver()
 
 	return oldT.Run(name, func(t *testing.T) {
 		suite.SetT(t)
 		defer suite.SetT(oldT)
 
-		defer recoverAndFailOnPanic(t)
+		if obs == nil {
+			defer recoverAndFailOnPanic(t)
+
+			if setupSubTest, ok := suite.s.(SetupSubTest); ok {
+				setupSubTest.SetupSubTest()
+			}
+
+			if tearDownSubTest, ok := suite.s.(TearDownSubTest); ok {
+				defer tearDownSubTest.TearDownSubTest()
+			}
+
+			subtest()
+			return
+		}
+
+		// Observed path. Statement and defer order mirrors the
+		// unobserved path exactly: a body panic still runs a deferred
+		// TearDownSubTest, while a panic in SetupSubTest happens before
+		// the TearDownSubTest defer is registered, so it does not run.
+		// The observer only records; it never changes the outcome.
+		obs.beginSubtest(t)
+		defer obs.finishSubtest(t)
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("test panicked: %v\n%s", r, debug.Stack())
+				t.FailNow()
+			}
+		}()
 
 		if setupSubTest, ok := suite.s.(SetupSubTest); ok {
-			setupSubTest.SetupSubTest()
+			obs.phase(t, PhaseSetupSubTest, setupSubTest.SetupSubTest)
 		}
 
 		if tearDownSubTest, ok := suite.s.(TearDownSubTest); ok {
-			defer tearDownSubTest.TearDownSubTest()
+			tearDown := tearDownSubTest
+			defer obs.phase(t, PhaseTearDownSubTest, tearDown.TearDownSubTest)
 		}
 
-		subtest()
+		obs.panicGuard(t, PhaseSubTest, subtest)
 	})
 }
 
@@ -128,10 +177,27 @@ type test = struct {
 // Run takes a testing suite and runs all of the tests attached
 // to it.
 func Run(t *testing.T, suite TestingSuite) {
+	run(t, suite, nil)
+}
+
+// run is the shared implementation of Run and RunObserved. When obs is nil
+// the suite runs with observation disabled and behaves exactly like the
+// historical Run; when obs is non nil the lifecycle is recorded without
+// changing any test outcome.
+func run(t *testing.T, suite TestingSuite, obs *executionObserver) {
 	defer recoverAndFailOnPanic(t)
 
 	suite.SetT(t)
 	suite.SetS(suite)
+
+	// Scope the observer to this run. This also detaches a run that does
+	// not opt into observation from an enclosing observed run, so nested
+	// suite runs can never double report or pollute each other.
+	if c, ok := suite.(observerCarrier); ok {
+		previous := c.currentExecutionObserver()
+		c.setExecutionObserver(obs)
+		defer c.setExecutionObserver(previous)
+	}
 
 	var stats *SuiteInformation
 	if _, ok := suite.(WithStats); ok {
@@ -141,6 +207,20 @@ func Run(t *testing.T, suite TestingSuite) {
 	var tests []test
 	methodFinder := reflect.TypeOf(suite)
 	suiteName := methodFinder.Elem().Name()
+
+	if obs != nil {
+		obs.beginSuite(t, suiteName)
+		// Register finish first and the skip check after it, so during
+		// unwind the skip event is emitted before the report is sealed.
+		// t.Skip (for example in SetupSuite) ends the goroutine through
+		// runtime.Goexit, so the check has to live in a defer.
+		defer obs.finishSuite(t)
+		defer func() {
+			if t.Skipped() {
+				obs.suiteSkipped(t)
+			}
+		}()
+	}
 
 	var matchMethodRE *regexp.Regexp
 	if *matchMethod != "" {
@@ -160,10 +240,16 @@ func Run(t *testing.T, suite TestingSuite) {
 		}
 		// Apply -testify.m filter
 		if matchMethodRE != nil && !matchMethodRE.MatchString(method.Name) {
+			if obs != nil {
+				obs.filtered(method.Name, t.Name(), *matchMethod)
+			}
 			continue
 		}
 		// Check method signature
 		if method.Type.NumIn() > 1 || method.Type.NumOut() > 0 {
+			if obs != nil {
+				obs.discovered(method.Name, t.Name(), false)
+			}
 			tests = append(tests, test{
 				name: method.Name,
 				run: func(t *testing.T) {
@@ -175,6 +261,9 @@ func Run(t *testing.T, suite TestingSuite) {
 			})
 			continue
 		}
+		if obs != nil {
+			obs.discovered(method.Name, t.Name(), true)
+		}
 		test := test{
 			name: method.Name,
 			run: func(t *testing.T) {
@@ -184,16 +273,22 @@ func Run(t *testing.T, suite TestingSuite) {
 				defer func() {
 					t.Helper()
 
+					// A panic from SetupTest, BeforeTest or the test body
+					// was already recorded by panicGuard; recover here so
+					// AfterTest and TearDownTest still run, exactly like
+					// the unobserved implementation.
 					r := recover()
 
 					stats.end(method.Name, !t.Failed() && r == nil)
 
 					if afterTestSuite, ok := suite.(AfterTest); ok {
-						afterTestSuite.AfterTest(suiteName, method.Name)
+						obs.phase(t, PhaseAfterTest, func() {
+							afterTestSuite.AfterTest(suiteName, method.Name)
+						})
 					}
 
 					if tearDownTestSuite, ok := suite.(TearDownTestSuite); ok {
-						tearDownTestSuite.TearDownTest()
+						obs.phase(t, PhaseTearDownTest, tearDownTestSuite.TearDownTest)
 					}
 
 					suite.SetT(parentT)
@@ -203,13 +298,17 @@ func Run(t *testing.T, suite TestingSuite) {
 				stats.start(method.Name)
 
 				if setupTestSuite, ok := suite.(SetupTestSuite); ok {
-					setupTestSuite.SetupTest()
+					obs.phase(t, PhaseSetupTest, setupTestSuite.SetupTest)
 				}
 				if beforeTestSuite, ok := suite.(BeforeTest); ok {
-					beforeTestSuite.BeforeTest(methodFinder.Elem().Name(), method.Name)
+					obs.phase(t, PhaseBeforeTest, func() {
+						beforeTestSuite.BeforeTest(methodFinder.Elem().Name(), method.Name)
+					})
 				}
 
-				method.Func.Call([]reflect.Value{reflect.ValueOf(suite)})
+				obs.panicGuard(t, PhaseTest, func() {
+					method.Func.Call([]reflect.Value{reflect.ValueOf(suite)})
+				})
 			},
 		}
 		tests = append(tests, test)
@@ -224,12 +323,12 @@ func Run(t *testing.T, suite TestingSuite) {
 	}
 
 	if setupAllSuite, ok := suite.(SetupAllSuite); ok {
-		setupAllSuite.SetupSuite()
+		obs.phase(t, PhaseSetupSuite, setupAllSuite.SetupSuite)
 	}
 
 	defer func() {
 		if tearDownAllSuite, ok := suite.(TearDownAllSuite); ok {
-			tearDownAllSuite.TearDownSuite()
+			obs.phase(t, PhaseTearDownSuite, tearDownAllSuite.TearDownSuite)
 		}
 
 		if suiteWithStats, measureStats := suite.(WithStats); measureStats {
@@ -238,16 +337,23 @@ func Run(t *testing.T, suite TestingSuite) {
 		}
 	}()
 
-	runTests(t, tests)
+	runTests(t, tests, obs)
 }
 
-func runTests(t *testing.T, tests []test) {
+func runTests(t *testing.T, tests []test, obs *executionObserver) {
 	if len(tests) == 0 {
 		t.Log("warning: no tests to run")
 		return
 	}
 
 	for _, test := range tests {
-		t.Run(test.name, test.run)
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			if obs != nil {
+				obs.beginTest(t)
+				defer obs.finishTest(t)
+			}
+			test.run(t)
+		})
 	}
 }
