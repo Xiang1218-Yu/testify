@@ -110,6 +110,7 @@ func (c *Call) Return(returnArguments ...interface{}) *Call {
 	defer c.unlock()
 
 	c.ReturnArguments = returnArguments
+	c.Parent.expectVersion++
 
 	return c
 }
@@ -122,6 +123,7 @@ func (c *Call) Panic(msg string) *Call {
 	defer c.unlock()
 
 	c.PanicMsg = &msg
+	c.Parent.expectVersion++
 
 	return c
 }
@@ -148,6 +150,7 @@ func (c *Call) Times(i int) *Call {
 	c.lock()
 	defer c.unlock()
 	c.Repeatability = i
+	c.Parent.expectVersion++
 	return c
 }
 
@@ -159,6 +162,7 @@ func (c *Call) WaitUntil(w <-chan time.Time) *Call {
 	c.lock()
 	defer c.unlock()
 	c.WaitFor = w
+	c.Parent.expectVersion++
 	return c
 }
 
@@ -169,6 +173,7 @@ func (c *Call) After(d time.Duration) *Call {
 	c.lock()
 	defer c.unlock()
 	c.waitTime = d
+	c.Parent.expectVersion++
 	return c
 }
 
@@ -184,6 +189,7 @@ func (c *Call) Run(fn func(args Arguments)) *Call {
 	c.lock()
 	defer c.unlock()
 	c.RunFn = fn
+	c.Parent.expectVersion++
 	return c
 }
 
@@ -193,6 +199,7 @@ func (c *Call) Maybe() *Call {
 	c.lock()
 	defer c.unlock()
 	c.optional = true
+	c.Parent.expectVersion++
 	return c
 }
 
@@ -248,6 +255,7 @@ func (c *Call) Unset() *Call {
 	}
 	// trim slice up to last copied index
 	c.Parent.ExpectedCalls = c.Parent.ExpectedCalls[:index]
+	c.Parent.expectVersion++
 
 	if !foundMatchingCall {
 		unlockOnce.Do(c.unlock)
@@ -277,6 +285,7 @@ func (c *Call) NotBefore(calls ...*Call) *Call {
 	}
 
 	c.requires = append(c.requires, calls...)
+	c.Parent.expectVersion++
 	return c
 }
 
@@ -312,6 +321,18 @@ type Mock struct {
 	// TestData holds any data that might be useful for testing.  Testify ignores
 	// this data completely allowing you to do whatever you like with it.
 	testData objx.Map
+
+	// expectVersion is bumped while mutex is held every time the expectation
+	// graph of this Mock is configured after creation (On, Return, Times,
+	// Run, NotBefore, Unset, ...). Call sessions snapshot it when freezing the
+	// expectation graph and use it to detect mutation while a session is live.
+	// It has no observable effect when sessions are not used.
+	expectVersion uint64
+
+	// session, when non-nil, routes MethodCalled through an active call
+	// session (recording or replay). It is nil by default, in which case
+	// MethodCalled follows the original, unchanged code path.
+	session sessionController
 
 	mutex sync.Mutex
 }
@@ -378,6 +399,7 @@ func (m *Mock) On(methodName string, arguments ...interface{}) *Call {
 
 	c := newCall(m, methodName, assert.CallerInfo(), arguments, make([]interface{}, 0))
 	m.ExpectedCalls = append(m.ExpectedCalls, c)
+	m.expectVersion++
 	return c
 }
 
@@ -496,6 +518,23 @@ func (m *Mock) Called(arguments ...interface{}) Arguments {
 // by appropriate [Mock.On] calls)
 // If Call.WaitFor is set, blocks until the channel is closed or receives a message.
 func (m *Mock) MethodCalled(methodName string, arguments ...interface{}) Arguments {
+	m.mutex.Lock()
+	// When a versioned call session (recording or replay) is attached, the
+	// call is routed through it. Sessions are disabled by default; when no
+	// session is attached this is a single nil comparison and the original
+	// code path below runs unchanged.
+	if s := m.session; s != nil {
+		m.mutex.Unlock()
+		return s.dispatch(m, methodName, arguments)
+	}
+	m.mutex.Unlock()
+	return m.methodCalledLegacy(methodName, arguments...)
+}
+
+// methodCalledLegacy is the original, unchanged call dispatch logic of
+// MethodCalled. Recording sessions mirror it and fall back to it whenever a
+// session aborts; replay sessions never invoke Run callbacks or waits.
+func (m *Mock) methodCalledLegacy(methodName string, arguments ...interface{}) Arguments {
 	m.mutex.Lock()
 	// TODO: could combine expected and closes in single loop
 	found, call := m.findExpectedCall(methodName, arguments...)
